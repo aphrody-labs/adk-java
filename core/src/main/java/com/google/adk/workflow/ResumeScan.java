@@ -65,6 +65,7 @@ final class ResumeScan {
   private static final String RESULT_KEY = "result";
   // Stands for text that is not JSON, since the JSON text null reads as a null value.
   private static final Object NOT_JSON = new Object();
+  private static final ImmutableSet<String> MESSAGE_KEYS = ImmutableSet.of("role", "parts");
   private static final ObjectReader STRICT_JSON =
       JsonBaseModel.getMapper()
           .readerFor(Object.class)
@@ -141,7 +142,9 @@ final class ResumeScan {
     Object output = recovered.output;
     if (output != null || recovered.route != null || transfer != null) {
       return Interception.replay(
-          output instanceof Content content ? processRehydratedOutput(node, content) : output,
+          recovered.outputFromContent && output instanceof Content content
+              ? processRehydratedOutput(node, content, recovered.outputDelegated)
+              : output,
           recovered.route,
           branch,
           transfer);
@@ -200,17 +203,23 @@ final class ResumeScan {
   }
 
   /**
-   * Returns the output of a node whose content was its output: the content's text, read as JSON
-   * when the node has an output schema that does not accept a string. Blank text is no output.
+   * Returns the output of a node whose content was its output: the content itself when the node has
+   * no output schema, is not an {@link LlmAgent} and gave the message itself rather than through a
+   * {@code delegated} child. Otherwise it is the content's text, read as JSON when the schema does
+   * not accept a string, and blank text is no output.
    *
    * @throws IllegalArgumentException if the schema needs JSON and the text is not JSON
    */
-  static @Nullable Object processRehydratedOutput(Node node, Content content) {
+  static @Nullable Object processRehydratedOutput(Node node, Content content, boolean delegated) {
+    Optional<Schema> schema = node.outputSchema();
+    // An LlmAgent's output is its text, not the message, and a delegate may be an LlmAgent.
+    if (schema.isEmpty() && !delegated && !(node instanceof LlmAgent)) {
+      return content;
+    }
     String text = textOf(content).trim();
     if (text.isEmpty()) {
       return null;
     }
-    Optional<Schema> schema = node.outputSchema();
     // Model text is raw rather than JSON-quoted, so it stays text when the schema accepts strings.
     if (schema.isEmpty() || acceptsString(schema.get())) {
       return text;
@@ -301,6 +310,13 @@ final class ResumeScan {
    */
   static final class RecoveredNode {
     @Nullable Object output;
+
+    /** Whether {@link #output} is a message read from an event's content, not its output field. */
+    boolean outputFromContent;
+
+    /** Whether {@link #output} came from a descendant that delegated it to this node. */
+    boolean outputDelegated;
+
     boolean failed;
     @Nullable ImmutableList<Route> route;
     @Nullable String branch;
@@ -516,8 +532,14 @@ final class ResumeScan {
     private static void recordOutcome(
         Event event, boolean isDirect, String ownerPath, RecoveredNode node) {
       Object eventOutput = event.output().orElse(null);
-      if (eventOutput == null && event.nodeInfo().map(NodeInfo::messageAsOutput).orElse(false)) {
-        eventOutput = event.content().orElse(null);
+      boolean fromContent = false;
+      if (event.nodeInfo().map(NodeInfo::messageAsOutput).orElse(false)) {
+        if (eventOutput == null) {
+          eventOutput = event.content().orElse(null);
+          fromContent = eventOutput != null;
+        } else if (event.content().isEmpty()) {
+          eventOutput = asMessage(eventOutput);
+        }
       }
       boolean isDelegated =
           eventOutput != null
@@ -527,6 +549,8 @@ final class ResumeScan {
       }
       if (eventOutput != null) {
         node.output = eventOutput;
+        node.outputFromContent = fromContent;
+        node.outputDelegated = !isDirect;
         // A delegate's output event carries the delegate's branch, not this node's.
         if (isDirect && event.output().isPresent()) {
           node.branch = event.branch().orElse(null);
@@ -546,6 +570,21 @@ final class ResumeScan {
         node.transferToAgent = null;
         node.failed = true;
       }
+    }
+
+    /**
+     * Returns {@code value} converted to a message if it is a message's JSON form, which is how a
+     * stored session gives back a message output; returns any other value unchanged.
+     */
+    private static Object asMessage(Object value) {
+      if (value instanceof Map<?, ?> map && MESSAGE_KEYS.containsAll(map.keySet())) {
+        try {
+          return JsonBaseModel.getMapper().convertValue(map, Content.class);
+        } catch (IllegalArgumentException e) {
+          return value;
+        }
+      }
+      return value;
     }
 
     /**
